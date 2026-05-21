@@ -1,0 +1,28 @@
+export const characterSlots = [
+  {
+    id: "lead",
+    label: "Lead Dancer",
+    url: "",
+    position: [-2.6, 1.2, 0],
+    rotationY: 0.35,
+    scaleMultiplier: 1.0,
+    targetHeight: 5.9,
+    offsetX: 0,
+    offsetY: 0,
+    offsetZ: 0,
+    accent: "#80b8ff",
+  },
+  {
+    id: "partner",
+    label: "Partner Dancer",
+    url: "",
+    position: [2.6, 1.2, 0],
+    rotationY: -0.35,
+    scaleMultiplier: 1.0,
+    targetHeight: 5.7,
+    offsetX: 0,
+    offsetY: 0,
+    offsetZ: 0,
+    accent: "#ff9ed6",
+  },
+];
