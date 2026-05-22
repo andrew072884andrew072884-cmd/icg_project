@@ -1,4 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  analyzeAudioBuffer,
+  computeBeatMetricsFromGrid,
+} from "../audio/analysis";
+
+const METRICS_UPDATE_INTERVAL_MS = 1000 / 30;
 
 const defaultMetrics = {
   currentTime: 0,
@@ -7,7 +13,11 @@ const defaultMetrics = {
   barIndex: 0,
   beatPhase: 0,
   beatPulse: 0,
+  beatDuration: 0.5,
   bassEnergy: 0,
+  currentSection: null,
+  isMainSection: false,
+  stageCue: "intro",
 };
 
 function createAudioElement() {
@@ -18,34 +28,96 @@ function createAudioElement() {
 }
 
 export default function useAudioEngine() {
-  const [bpm, setBpm] = useState(120);
+  const [manualBpm, setManualBpm] = useState(120);
+  const [detectedBpm, setDetectedBpm] = useState(null);
+  const [timingMode, setTimingMode] = useState("auto");
+  const [beatOffsetMs, setBeatOffsetMs] = useState(0);
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedTrackName, setSelectedTrackName] = useState("");
   const [audioMetrics, setAudioMetrics] = useState(defaultMetrics);
+  const [analysisState, setAnalysisState] = useState("idle");
+  const [analysisError, setAnalysisError] = useState("");
+  const [sectionCandidates, setSectionCandidates] = useState([]);
 
   const audioRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const sourceNodeRef = useRef(null);
-  const rafRef = useRef(0);
+  const metricsTimerRef = useRef(0);
   const objectUrlRef = useRef("");
+  const beatTimesRef = useRef([]);
+  const sectionsRef = useRef([]);
 
   if (!audioRef.current) {
     audioRef.current = createAudioElement();
   }
 
   const audio = audioRef.current;
+  const effectiveBpm = timingMode === "auto" ? detectedBpm ?? manualBpm : manualBpm;
+
+  const findCurrentSection = useCallback((currentTime) => {
+    return (
+      sectionsRef.current.find(
+        (section) => currentTime >= section.startTime && currentTime < section.endTime,
+      ) ?? null
+    );
+  }, []);
+
+  const resolveStageCue = useCallback(
+    (currentTime, beatDuration, currentSection) => {
+      if (currentSection) {
+        return "chorus";
+      }
+
+      if (currentTime < 12) {
+        return "intro";
+      }
+
+      const nextSection = sectionsRef.current.find((section) => section.startTime > currentTime);
+
+      if (nextSection && nextSection.startTime - currentTime <= beatDuration * 8) {
+        return "preChorus";
+      }
+
+      return "verse";
+    },
+    [],
+  );
 
   const updateMetrics = useCallback(() => {
     const currentTime = audio.currentTime || 0;
     const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
-    const beatsPerSecond = bpm / 60;
-    const rawBeat = currentTime * beatsPerSecond;
-    const beatIndex = Math.floor(rawBeat);
-    const beatPhase = rawBeat - beatIndex;
-    const barIndex = Math.floor(beatIndex / 4);
-    const beatPulse = Math.max(0, 1 - beatPhase * 4);
+    const offsetSeconds = beatOffsetMs / 1000;
+    const currentSection = findCurrentSection(currentTime);
+
+    let beatMetrics;
+
+    if (timingMode === "auto" && beatTimesRef.current.length) {
+      beatMetrics = computeBeatMetricsFromGrid(
+        currentTime - offsetSeconds,
+        duration,
+        beatTimesRef.current,
+        effectiveBpm,
+        [],
+      );
+    } else {
+      const adjustedTime = Math.max(0, currentTime - offsetSeconds);
+      const beatsPerSecond = effectiveBpm / 60;
+      const rawBeat = adjustedTime * beatsPerSecond;
+      const beatIndex = Math.floor(rawBeat);
+      const beatPhase = rawBeat - beatIndex;
+
+      beatMetrics = {
+        currentTime,
+        duration,
+        beatIndex,
+        barIndex: Math.floor(beatIndex / 4),
+        beatPhase,
+        beatPulse: Math.max(0, 1 - beatPhase * 4),
+        beatDuration: 60 / effectiveBpm,
+      };
+    }
 
     let bassEnergy = 0;
 
@@ -65,24 +137,28 @@ export default function useAudioEngine() {
     }
 
     setAudioMetrics({
+      ...beatMetrics,
       currentTime,
       duration,
-      beatIndex,
-      barIndex,
-      beatPhase,
-      beatPulse,
       bassEnergy,
+      currentSection,
+      isMainSection: Boolean(currentSection),
+      stageCue: resolveStageCue(
+        currentTime,
+        beatMetrics.beatDuration ?? 60 / effectiveBpm,
+        currentSection,
+      ),
     });
-  }, [audio, bpm]);
+  }, [audio, beatOffsetMs, effectiveBpm, findCurrentSection, resolveStageCue, timingMode]);
 
   const tick = useCallback(() => {
     updateMetrics();
-    rafRef.current = window.requestAnimationFrame(tick);
+    metricsTimerRef.current = window.setTimeout(tick, METRICS_UPDATE_INTERVAL_MS);
   }, [updateMetrics]);
 
   const stopTick = useCallback(() => {
-    window.cancelAnimationFrame(rafRef.current);
-    rafRef.current = 0;
+    window.clearTimeout(metricsTimerRef.current);
+    metricsTimerRef.current = 0;
   }, []);
 
   const ensureAudioGraph = useCallback(async () => {
@@ -107,7 +183,7 @@ export default function useAudioEngine() {
   }, [audio]);
 
   const handleFileSelect = useCallback(
-    (event) => {
+    async (event) => {
       const file = event.target.files?.[0];
 
       if (!file) {
@@ -129,6 +205,34 @@ export default function useAudioEngine() {
       setSelectedTrackName(file.name);
       setIsReady(false);
       setAudioMetrics(defaultMetrics);
+      setAnalysisState("analyzing");
+      setAnalysisError("");
+      setDetectedBpm(null);
+      beatTimesRef.current = [];
+      sectionsRef.current = [];
+      setSectionCandidates([]);
+
+      try {
+        const fileBuffer = await file.arrayBuffer();
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        const decodeContext = new AudioContextClass();
+        try {
+          const decodedBuffer = await decodeContext.decodeAudioData(fileBuffer.slice(0));
+          const analysis = await analyzeAudioBuffer(decodedBuffer);
+
+          setDetectedBpm(analysis.detectedBpm);
+          beatTimesRef.current = analysis.beatTimes;
+          sectionsRef.current = analysis.sections;
+          setSectionCandidates(analysis.sections);
+          setAnalysisState("ready");
+        } finally {
+          await decodeContext.close();
+        }
+      } catch (error) {
+        console.error("Audio analysis failed", error);
+        setAnalysisState("error");
+        setAnalysisError("Automatic beat detection failed. You can still set BPM manually.");
+      }
     },
     [audio, stopTick],
   );
@@ -140,8 +244,38 @@ export default function useAudioEngine() {
       return;
     }
 
-    setBpm(Math.min(220, Math.max(40, Math.round(nextValue))));
+    const nextBpm = Math.min(220, Math.max(40, Math.round(nextValue)));
+    setManualBpm(nextBpm);
   }, []);
+
+  const handleTimingModeChange = useCallback((nextMode) => {
+    setTimingMode(nextMode);
+  }, []);
+
+  const handleBeatOffsetChange = useCallback((event) => {
+    const nextValue = Number(event.target.value);
+
+    if (!Number.isFinite(nextValue)) {
+      return;
+    }
+
+    setBeatOffsetMs(Math.min(2000, Math.max(-2000, Math.round(nextValue))));
+  }, []);
+
+  const handleSeekChange = useCallback(
+    (event) => {
+      const nextValue = Number(event.target.value);
+
+      if (!Number.isFinite(nextValue) || !audio.src) {
+        return;
+      }
+
+      const duration = Number.isFinite(audio.duration) ? audio.duration : nextValue;
+      audio.currentTime = Math.min(duration, Math.max(0, nextValue));
+      updateMetrics();
+    },
+    [audio, updateMetrics],
+  );
 
   const togglePlayback = useCallback(async () => {
     if (!audio.src) {
@@ -218,7 +352,7 @@ export default function useAudioEngine() {
 
   useEffect(() => {
     updateMetrics();
-  }, [bpm, updateMetrics]);
+  }, [beatOffsetMs, effectiveBpm, timingMode, updateMetrics]);
 
   useEffect(
     () => () => {
@@ -238,12 +372,22 @@ export default function useAudioEngine() {
 
   return {
     audioMetrics,
-    bpm,
+    bpm: effectiveBpm,
+    manualBpm,
+    detectedBpm,
+    timingMode,
+    beatOffsetMs,
     isReady,
     isPlaying,
     selectedTrackName,
+    analysisState,
+    analysisError,
+    sectionCandidates,
     handleFileSelect,
     handleBpmChange,
+    handleTimingModeChange,
+    handleBeatOffsetChange,
+    handleSeekChange,
     togglePlayback,
     restartPlayback,
   };
