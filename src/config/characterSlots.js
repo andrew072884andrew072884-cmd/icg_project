@@ -2,7 +2,7 @@ export const characterSlots = [
   {
     id: "lead",
     label: "Lead Dancer",
-    url: "",
+    url: "/assets/characters/Slow Jog Backwards.fbx",
     position: [-3.1, 1.2, 0],
     rotationY: 0.35,
     animationSet: "embeddedHumanoid",
@@ -17,7 +17,7 @@ export const characterSlots = [
   {
     id: "partner",
     label: "Partner Dancer",
-    url: "",
+    url: "/assets/characters/Capoeira.fbx",
     position: [3.1, 1.2, 0],
     rotationY: -0.35,
     animationSet: "embeddedHumanoid",

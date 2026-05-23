@@ -12,6 +12,11 @@ import { getFormationPose } from "../dance/formationLibrary";
 import { getProceduralDancePose } from "../dance/proceduralDance";
 
 function prepareCharacterScene(source, slot) {
+  // Ensure the source hierarchy has updated world matrices before cloning,
+  // otherwise SkeletonUtils might bind the cloned skeleton with wrong bone scales/positions
+  // (which causes detached meshes or giant shoes in FBX).
+  source.updateMatrixWorld(true);
+
   const clonedScene = SkeletonUtils.clone(source);
 
   clonedScene.traverse((child) => {
@@ -36,7 +41,32 @@ function prepareCharacterScene(source, slot) {
 
   clonedScene.updateMatrixWorld(true);
 
-  const bounds = new THREE.Box3().setFromObject(clonedScene);
+  /* Compute bounds from raw geometry positions instead of the scene object.
+     For SkinnedMesh the vertex buffer is already in bind-pose space, so this
+     gives us the correct T-pose / A-pose dimensions without touching the
+     skeleton (which can break Mixamo FBX meshes). */
+  const bounds = new THREE.Box3();
+  const tempBox = new THREE.Box3();
+  let hasGeometry = false;
+
+  clonedScene.traverse((child) => {
+    if (!child.isMesh || !child.geometry?.attributes?.position) {
+      return;
+    }
+
+    tempBox.setFromBufferAttribute(child.geometry.attributes.position);
+
+    if (!child.isSkinnedMesh) {
+      tempBox.applyMatrix4(child.matrixWorld);
+    }
+
+    bounds.union(tempBox);
+    hasGeometry = true;
+  });
+
+  if (!hasGeometry) {
+    bounds.setFromObject(clonedScene);
+  }
   const size = new THREE.Vector3();
   const center = new THREE.Vector3();
   bounds.getSize(size);
@@ -60,11 +90,16 @@ function prepareCharacterScene(source, slot) {
 }
 
 function restoreSkeletonPose(scene) {
+  // Disabling skeleton.pose() because FBX skeletons from Mixamo often have 
+  // complex node hierarchies where calling pose() breaks the bind matrices,
+  // causing parts of the mesh to fly away or scale infinitely.
+  /*
   scene.traverse((child) => {
     if (child.isSkinnedMesh && child.skeleton) {
       child.skeleton.pose();
     }
   });
+  */
 }
 
 function FittedCharacter({ scene, animations = [], slot, syncState, danceState }) {
