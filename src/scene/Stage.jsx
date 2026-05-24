@@ -21,6 +21,7 @@ export default function Stage({ syncState }) {
   const danceFloor = useRef(null);
   const backdrop = useRef(null);
   const backdropGlow = useRef(null);
+  const chorusReleaseRef = useRef(0);
 
   const looks = useMemo(
     () => ({
@@ -31,16 +32,16 @@ export default function Stage({ syncState }) {
         backdropBoost: 0.18,
       },
       verse: {
-        floorColor: "#12304d",
-        floorBoost: 0.32,
-        backdropColor: "#25235b",
-        backdropBoost: 0.42,
+        floorColor: "#0e3859",
+        floorBoost: 0.38,
+        backdropColor: "#14346b",
+        backdropBoost: 0.5,
       },
       preChorus: {
-        floorColor: "#3c2e73",
-        floorBoost: 0.58,
-        backdropColor: "#542c6f",
-        backdropBoost: 0.78,
+        floorColor: "#5a236d",
+        floorBoost: 0.72,
+        backdropColor: "#7a246b",
+        backdropBoost: 1.05,
       },
       chorus: {
         floorColor: "#3556a9",
@@ -54,8 +55,8 @@ export default function Stage({ syncState }) {
   const ledPalettes = useMemo(
     () => ({
       intro: ["#10264a", "#251657", "#12364d"],
-      verse: ["#2254b8", "#522cbb", "#0f879c", "#2742a0"],
-      preChorus: ["#ff4fad", "#7b5cff", "#21e0d1", "#ffc857"],
+      verse: ["#1767d1", "#0d9fc0", "#1c47a7"],
+      preChorus: ["#ff37b8", "#19ffe0", "#8a5cff", "#ffb22e"],
       chorus: ["#ff2d95", "#35f3ff", "#9f6bff", "#fff06a", "#4dffb8", "#ff6b4a"],
     }),
     [],
@@ -68,19 +69,39 @@ export default function Stage({ syncState }) {
     [],
   );
 
-  useFrame(() => {
+  useFrame((_, delta) => {
     const beatPulse = syncState?.beatPulse ?? 0;
     const beatIndex = syncState?.beatIndex ?? 0;
     const beatPhase = syncState?.beatPhase ?? 0;
     const bassEnergy = syncState?.bassEnergy ?? 0;
     const stageCue = syncState?.stageCue ?? "intro";
     const look = looks[stageCue] ?? looks.intro;
-    const sectionBoost = stageCue === "chorus" ? 0.3 : stageCue === "preChorus" ? 0.12 : 0;
+    chorusReleaseRef.current = THREE.MathUtils.damp(
+      chorusReleaseRef.current,
+      stageCue === "chorus" ? 1 : 0,
+      stageCue === "chorus" ? 10 : 1.25,
+      delta,
+    );
+    const chorusRelease =
+      stageCue === "chorus" || stageCue === "intro" ? 0 : chorusReleaseRef.current;
+    const sectionBoost = stageCue === "chorus" ? 0.3 : stageCue === "preChorus" ? 0.2 : 0;
     const palette = ledPalettes[stageCue] ?? ledPalettes.intro;
-    const paletteStep = stageCue === "chorus" ? 1 : 2;
+    const paletteStep = stageCue === "verse" ? 4 : stageCue === "preChorus" || stageCue === "chorus" ? 1 : 2;
     const paletteIndex = Math.floor(beatIndex / paletteStep) % palette.length;
     const nextPaletteIndex = (paletteIndex + 1) % palette.length;
-    const colorBlend = stageCue === "chorus" ? beatPhase * 0.55 : beatPhase * 0.28;
+    const dropBlackout =
+      stageCue === "preChorus" && beatIndex % 16 === 15 && beatPhase > 0.18 && beatPhase < 0.92
+        ? 1
+        : 0;
+    const blackoutScale = 1 - dropBlackout * 0.86;
+    const colorBlend =
+      stageCue === "verse"
+        ? beatPhase * 0.12
+        : stageCue === "preChorus"
+          ? beatPhase * 0.78
+          : stageCue === "chorus"
+            ? beatPhase * 0.55
+            : beatPhase * 0.28;
 
     colorScratch.current.set(palette[paletteIndex]);
     colorScratch.next.set(palette[nextPaletteIndex]);
@@ -89,7 +110,12 @@ export default function Stage({ syncState }) {
     if (danceFloor.current) {
       danceFloor.current.material.emissive.set(look.floorColor);
       danceFloor.current.material.emissiveIntensity =
-        look.floorBoost + beatPulse * 1.15 + bassEnergy * 0.55 + sectionBoost;
+        (look.floorBoost +
+          beatPulse * 1.15 +
+          bassEnergy * 0.55 +
+          sectionBoost +
+          chorusRelease * 0.28) *
+        blackoutScale;
       const scale = 1 + beatPulse * 0.025 + sectionBoost * 0.01;
       danceFloor.current.scale.set(scale, 1, scale);
     }
@@ -98,17 +124,31 @@ export default function Stage({ syncState }) {
       backdrop.current.material.color.lerp(colorScratch.current, 0.08);
       backdrop.current.material.emissive.lerp(colorScratch.current, 0.14);
       backdrop.current.material.emissiveIntensity =
-        look.backdropBoost + beatPulse * 0.82 + bassEnergy * 0.64 + sectionBoost * 0.62;
+        (look.backdropBoost +
+          beatPulse * 0.82 +
+          bassEnergy * 0.64 +
+          sectionBoost * 0.62 +
+          chorusRelease * 0.34) *
+        blackoutScale;
       backdrop.current.material.opacity =
-        stageCue === "intro" ? 0.58 : stageCue === "verse" ? 0.78 : 0.88;
+        Math.min(
+          0.94,
+          (stageCue === "intro" ? 0.58 : stageCue === "verse" ? 0.72 : stageCue === "preChorus" ? 0.94 : 0.88) +
+            chorusRelease * 0.1,
+        ) *
+        (1 - dropBlackout * 0.55);
     }
 
     if (backdropGlow.current) {
       backdropGlow.current.material.color.lerp(colorScratch.current, 0.16);
       backdropGlow.current.material.opacity = Math.min(
         0.48,
-        look.backdropBoost * 0.16 + beatPulse * 0.18 + bassEnergy * 0.14 + sectionBoost * 0.08,
-      );
+        look.backdropBoost * 0.16 +
+          beatPulse * 0.18 +
+          bassEnergy * 0.14 +
+          sectionBoost * 0.08 +
+          chorusRelease * 0.08,
+      ) * blackoutScale;
     }
   });
 
@@ -185,16 +225,6 @@ export default function Stage({ syncState }) {
 
       <NeonFrame position={[-8, 6, -22.1]} scale={[1.35, 1.35, 1]} />
       <NeonFrame position={[8, 6, -22.1]} scale={[1.35, 1.35, 1]} />
-
-      <mesh position={[-3.1, 0.65, 0]} castShadow receiveShadow>
-        <cylinderGeometry args={[0.95, 1.15, 1.1, 32]} />
-        <meshStandardMaterial color="#17243a" metalness={0.2} roughness={0.7} />
-      </mesh>
-
-      <mesh position={[3.1, 0.65, 0]} castShadow receiveShadow>
-        <cylinderGeometry args={[0.95, 1.15, 1.1, 32]} />
-        <meshStandardMaterial color="#2a1832" metalness={0.2} roughness={0.7} />
-      </mesh>
     </group>
   );
 }

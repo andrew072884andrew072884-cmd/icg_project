@@ -14,7 +14,7 @@ export default function SceneRoot({ started, syncState, cameraMode, danceState }
       <color attach="background" args={["#040712"]} />
       <BeatHaze syncState={syncState} />
 
-      <StageLights started={started} syncState={syncState} />
+      <StageLights started={started} syncState={syncState} danceState={danceState} />
 
       <Suspense fallback={null}>
         <Stage syncState={syncState} />
@@ -26,6 +26,7 @@ export default function SceneRoot({ started, syncState, cameraMode, danceState }
         cameraMode={cameraMode}
         syncState={syncState}
         started={started}
+        danceState={danceState}
       />
 
       <OrbitControls

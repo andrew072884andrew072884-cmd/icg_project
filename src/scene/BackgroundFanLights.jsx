@@ -54,14 +54,15 @@ const fanRigs = [
 
 const visibilityProfiles = {
   intro: { visibility: 0.16, length: 11.2, opacity: 0.13, width: 0.18 },
-  verse: { visibility: 0.52, length: 13.4, opacity: 0.2, width: 0.22 },
-  preChorus: { visibility: 0.82, length: 15.2, opacity: 0.3, width: 0.27 },
+  verse: { visibility: 0.54, length: 14.2, opacity: 0.22, width: 0.23 },
+  preChorus: { visibility: 0.96, length: 16.8, opacity: 0.38, width: 0.31 },
   chorus: { visibility: 1, length: 17.4, opacity: 0.42, width: 0.33 },
 };
 
 const fanModeProfiles = {
   off: { visibility: 0, opacityMultiplier: 0, widthMultiplier: 0.8, lengthMultiplier: 0.92 },
   weak: { visibility: 0.42, opacityMultiplier: 0.48, widthMultiplier: 0.82, lengthMultiplier: 0.96 },
+  preBuild: { visibility: 0.86, opacityMultiplier: 0.94, widthMultiplier: 0.98, lengthMultiplier: 0.99 },
   full: { visibility: 1, opacityMultiplier: 1.18, widthMultiplier: 1.08, lengthMultiplier: 1 },
 };
 
@@ -78,11 +79,11 @@ function resolveFanMode(stageCue, beatIndex, beatPulse, bassEnergy) {
   }
 
   if (stageCue === "verse") {
-    return "weak";
+    return beatIndex % 16 < 4 || beatIndex % 16 >= 12 ? "weak" : "off";
   }
 
   if (stageCue === "preChorus") {
-    return beatIndex % 4 === 0 || beatPulse > 0.72 || bassEnergy > 0.48 ? "full" : "weak";
+    return beatIndex % 2 === 0 || beatPulse > 0.58 || bassEnergy > 0.4 ? "full" : "preBuild";
   }
 
   if (stageCue === "chorus") {
@@ -90,6 +91,14 @@ function resolveFanMode(stageCue, beatIndex, beatPulse, bassEnergy) {
   }
 
   return "weak";
+}
+
+function getFanRigVisibility(stageCue, fanRig) {
+  if (stageCue === "verse") {
+    return fanRig.type === "sideInward" ? 1 : 0;
+  }
+
+  return 1;
 }
 
 function createFanMaterial(color) {
@@ -182,6 +191,7 @@ function getFanDirection(fanRig, centered, spreadBreath, dynamicTiltDegrees, tar
 export default function BackgroundFanLights({ syncState }) {
   const fanGroupRefs = useRef([]);
   const rayRefs = useRef([]);
+  const chorusReleaseRef = useRef(0);
 
   const rayMaterials = useMemo(
     () =>
@@ -201,7 +211,7 @@ export default function BackgroundFanLights({ syncState }) {
     [],
   );
 
-  useFrame(({ clock }) => {
+  useFrame(({ clock }, delta) => {
     const time = clock.getElapsedTime();
     const beatIndex = syncState?.beatIndex ?? 0;
     const beatPhase = syncState?.beatPhase ?? 0;
@@ -211,6 +221,14 @@ export default function BackgroundFanLights({ syncState }) {
     const profile = visibilityProfiles[stageCue] ?? visibilityProfiles.intro;
     const fanMode = resolveFanMode(stageCue, beatIndex, beatPulse, bassEnergy);
     const modeProfile = fanModeProfiles[fanMode] ?? fanModeProfiles.weak;
+    chorusReleaseRef.current = THREE.MathUtils.damp(
+      chorusReleaseRef.current,
+      stageCue === "chorus" ? 1 : 0,
+      stageCue === "chorus" ? 10 : 1.15,
+      delta,
+    );
+    const chorusRelease =
+      stageCue === "chorus" || stageCue === "intro" ? 0 : chorusReleaseRef.current;
     const sectionColor = sectionColors[stageCue] ?? sectionColors.intro;
     const beatGate = Math.max(0, 1 - beatPhase * 2.4);
     const strongBeat = beatIndex % 4 === 0 ? 1.35 : beatIndex % 2 === 0 ? 0.95 : 0.64;
@@ -220,12 +238,26 @@ export default function BackgroundFanLights({ syncState }) {
 
     fanRigs.forEach((fanRig, fanIndex) => {
       const fanGroup = fanGroupRefs.current[fanIndex];
+      const rigVisibility = getFanRigVisibility(stageCue, fanRig);
+      const dynamicEnergy = 0.78 + beatPulse * 1.65 + beatGate * strongBeat * 0.62 + bassEnergy * 0.72;
+      const chorusReleaseOpacity =
+        visibilityProfiles.chorus.opacity *
+        visibilityProfiles.chorus.visibility *
+        fanModeProfiles.full.visibility *
+        fanModeProfiles.full.opacityMultiplier *
+        dynamicEnergy *
+        chorusRelease *
+        0.58;
       const targetOpacity =
-        profile.opacity *
-        profile.visibility *
-        modeProfile.visibility *
-        modeProfile.opacityMultiplier *
-        (0.78 + beatPulse * 1.65 + beatGate * strongBeat * 0.62 + bassEnergy * 0.72);
+        Math.max(
+          profile.opacity *
+            profile.visibility *
+            modeProfile.visibility *
+            modeProfile.opacityMultiplier *
+            rigVisibility *
+            dynamicEnergy,
+          chorusReleaseOpacity,
+        );
 
       if (fanGroup) {
         scratch.origin.set(...fanRig.origin);
@@ -277,7 +309,7 @@ export default function BackgroundFanLights({ syncState }) {
         scratch.orientation.setFromUnitVectors(scratch.localBeamAxis, direction);
         ray.quaternion.copy(scratch.orientation);
         ray.scale.set(width, length, 1);
-        ray.visible = material.uniforms.uOpacity.value > 0.006;
+        ray.visible = true;
       }
     });
   });

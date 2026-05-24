@@ -1,15 +1,201 @@
 import { Float, Html, useFBX, useGLTF } from "@react-three/drei";
-import { useEffect, useMemo, useRef } from "react";
-import { useFrame } from "@react-three/fiber";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useFrame, useLoader } from "@react-three/fiber";
 import * as THREE from "three";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+import { FBXLoader } from "three-stdlib";
 import { characterSlots } from "../config/characterSlots";
 import {
+  applyOriginalPuppetPose,
+  createOriginalPuppetRig,
+  getOriginalRootMotionPose,
+  loadOriginalMovieData,
+} from "../dance/originalMovie";
+import { danceMoveMap } from "../dance/danceLibrary";
+import {
+  createExternalDanceAnimationClips,
+  getExternalDanceAnimationSourcesForMoveIds,
   getSyncedClipTime,
+  retargetExternalAnimationClipsToScene,
   resolveDanceAnimationClip,
 } from "../dance/animationRegistry";
 import { getFormationPose } from "../dance/formationLibrary";
 import { getProceduralDancePose } from "../dance/proceduralDance";
+import OriginalBlockDancers from "./OriginalBlockDancers";
+
+const STAGE_CONTACT_Y = 0.42;
+const FOOT_CONTACT_BONE_NAMES = [
+  "leftToeBase",
+  "rightToeBase",
+  "leftToeEnd",
+  "rightToeEnd",
+  "leftFoot",
+  "rightFoot",
+];
+const ACTION_TRANSITION_BEATS = 2;
+const FLOORWORK_CONTACT_TAGS = new Set(["floorwork"]);
+
+function smoothstep(value) {
+  const x = Math.min(1, Math.max(0, value));
+
+  return x * x * (3 - 2 * x);
+}
+
+function getPoseModuleBlend(moveId, modulePhase) {
+  if (!danceMoveMap[moveId]?.tags?.includes("poseHold")) {
+    return null;
+  }
+
+  if (modulePhase < 0.25) {
+    return smoothstep(modulePhase / 0.25);
+  }
+
+  return 1;
+}
+
+function getActionTransitionState(modulePhase, activeBeatSpan = 8) {
+  const beatSpan = Math.max(1, activeBeatSpan || 8);
+  const windowPhase = Math.min(0.22, ACTION_TRANSITION_BEATS / beatSpan);
+
+  if (modulePhase >= windowPhase) {
+    return {
+      blend: 1,
+      previousPhase: 1,
+      windowPhase,
+    };
+  }
+
+  const blend = smoothstep(modulePhase / windowPhase);
+
+  return {
+    blend,
+    previousPhase: 0.999,
+    windowPhase,
+  };
+}
+
+function normalizeRigNodeName(value) {
+  const nodeName = String(value ?? "");
+  const namespaceIndex = nodeName.lastIndexOf(":");
+  const withoutNamespace =
+    namespaceIndex >= 0 ? nodeName.slice(namespaceIndex + 1) : nodeName;
+  const withoutMixamoPrefix = withoutNamespace.replace(/^mixamorig\d*/i, "");
+
+  return withoutMixamoPrefix.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function createFootContactRig(scene) {
+  const targetNames = new Set(FOOT_CONTACT_BONE_NAMES.map(normalizeRigNodeName));
+  const bones = [];
+
+  scene.traverse((child) => {
+    if (!child.isBone) {
+      return;
+    }
+
+    if (targetNames.has(normalizeRigNodeName(child.name))) {
+      bones.push(child);
+    }
+  });
+
+  return {
+    bones,
+    scratchPosition: new THREE.Vector3(),
+  };
+}
+
+function createVisibleContactRig(scene) {
+  const meshes = [];
+
+  scene.traverse((child) => {
+    if (!child.isMesh || !child.geometry) {
+      return;
+    }
+
+    meshes.push(child);
+  });
+
+  return {
+    meshes,
+    bounds: new THREE.Box3(),
+    meshBounds: new THREE.Box3(),
+  };
+}
+
+function groundCharacterToLowestFoot(root, contactRig, stageY = STAGE_CONTACT_Y) {
+  if (!root || !contactRig?.bones?.length) {
+    return;
+  }
+
+  root.updateMatrixWorld(true);
+
+  let lowestFootY = Infinity;
+
+  contactRig.bones.forEach((bone) => {
+    bone.getWorldPosition(contactRig.scratchPosition);
+    lowestFootY = Math.min(lowestFootY, contactRig.scratchPosition.y);
+  });
+
+  if (!Number.isFinite(lowestFootY)) {
+    return;
+  }
+
+  root.position.y += stageY - lowestFootY;
+  root.updateMatrixWorld(true);
+}
+
+function groundCharacterToVisibleBounds(root, contactRig, stageY = STAGE_CONTACT_Y) {
+  if (!root || !contactRig?.meshes?.length) {
+    return;
+  }
+
+  root.updateMatrixWorld(true);
+  contactRig.bounds.makeEmpty();
+
+  contactRig.meshes.forEach((mesh) => {
+    if (mesh.isSkinnedMesh && typeof mesh.computeBoundingBox === "function") {
+      mesh.computeBoundingBox();
+
+      if (mesh.boundingBox) {
+        contactRig.meshBounds.copy(mesh.boundingBox).applyMatrix4(mesh.matrixWorld);
+        contactRig.bounds.union(contactRig.meshBounds);
+      }
+
+      return;
+    }
+
+    if (!mesh.geometry.boundingBox) {
+      mesh.geometry.computeBoundingBox();
+    }
+
+    if (mesh.geometry.boundingBox) {
+      contactRig.meshBounds.copy(mesh.geometry.boundingBox).applyMatrix4(mesh.matrixWorld);
+      contactRig.bounds.union(contactRig.meshBounds);
+    }
+  });
+
+  if (contactRig.bounds.isEmpty() || !Number.isFinite(contactRig.bounds.min.y)) {
+    return;
+  }
+
+  root.position.y += stageY - contactRig.bounds.min.y;
+  root.updateMatrixWorld(true);
+}
+
+function usesVisibleFloorContact(moveId) {
+  const tags = danceMoveMap[moveId]?.tags ?? [];
+
+  return tags.some((tag) => FLOORWORK_CONTACT_TAGS.has(tag));
+}
+
+function groundCharacterToStage(root, footContactRig, visibleContactRig, moveId) {
+  if (usesVisibleFloorContact(moveId)) {
+    groundCharacterToVisibleBounds(root, visibleContactRig);
+    return;
+  }
+
+  groundCharacterToLowestFoot(root, footContactRig);
+}
 
 function prepareCharacterScene(source, slot) {
   // Ensure the source hierarchy has updated world matrices before cloning,
@@ -102,12 +288,79 @@ function restoreSkeletonPose(scene) {
   */
 }
 
-function FittedCharacter({ scene, animations = [], slot, syncState, danceState }) {
+function useExternalDanceAnimationClips(danceState) {
+  const moveIdKey = useMemo(() => {
+    const moveIds = new Set(["neutral-ready"]);
+
+    danceState?.sequence?.forEach((slot) => {
+      if (slot.moveId) {
+        moveIds.add(slot.moveId);
+      }
+    });
+
+    if (danceState?.activeMove?.id) {
+      moveIds.add(danceState.activeMove.id);
+    }
+
+    return Array.from(moveIds).sort().join("|");
+  }, [danceState?.activeMove?.id, danceState?.sequence]);
+  const externalSources = useMemo(
+    () => getExternalDanceAnimationSourcesForMoveIds(moveIdKey.split("|")),
+    [moveIdKey],
+  );
+  const loadedFbxFiles = useLoader(
+    FBXLoader,
+    externalSources.map((source) => source.url),
+  );
+
+  return useMemo(
+    () => createExternalDanceAnimationClips(loadedFbxFiles, externalSources),
+    [externalSources, loadedFbxFiles],
+  );
+}
+
+function FittedCharacter({
+  scene,
+  animations = [],
+  externalAnimations = [],
+  originalMovieData,
+  slot,
+  syncState,
+  danceState,
+}) {
   const root = useRef(null);
   const mixer = useRef(null);
   const activeAction = useRef(null);
   const activeBinding = useRef(null);
+  const activeSupportAction = useRef(null);
+  const activeSupportBinding = useRef(null);
+  const transitionAction = useRef(null);
+  const transitionBinding = useRef(null);
   const fitted = useMemo(() => prepareCharacterScene(scene, slot), [scene, slot]);
+  const retargetedExternalAnimations = useMemo(
+    () => retargetExternalAnimationClipsToScene(externalAnimations, fitted.clonedScene),
+    [externalAnimations, fitted.clonedScene],
+  );
+  const availableAnimations = useMemo(
+    () => [...retargetedExternalAnimations, ...animations],
+    [animations, retargetedExternalAnimations],
+  );
+  const originalPuppetRig = useMemo(
+    () => createOriginalPuppetRig(fitted.clonedScene),
+    [fitted.clonedScene],
+  );
+  const footContactRig = useMemo(
+    () => createFootContactRig(fitted.clonedScene),
+    [fitted.clonedScene],
+  );
+  const visibleContactRig = useMemo(
+    () => createVisibleContactRig(fitted.clonedScene),
+    [fitted.clonedScene],
+  );
+  const slotBasePositions = useMemo(
+    () => Object.fromEntries(characterSlots.map((characterSlot) => [characterSlot.id, characterSlot.position])),
+    [],
+  );
 
   useEffect(() => {
     mixer.current = new THREE.AnimationMixer(fitted.clonedScene);
@@ -117,44 +370,146 @@ function FittedCharacter({ scene, animations = [], slot, syncState, danceState }
       mixer.current = null;
       activeAction.current = null;
       activeBinding.current = null;
+      activeSupportAction.current = null;
+      activeSupportBinding.current = null;
+      transitionAction.current = null;
+      transitionBinding.current = null;
     };
   }, [fitted.clonedScene]);
 
-  useEffect(() => {
-    if (!mixer.current || !danceState?.activeMove?.id) {
+  useLayoutEffect(() => {
+    if (!mixer.current) {
       return;
     }
 
-    const resolved = resolveDanceAnimationClip({
-      moveId: danceState.activeMove.id,
-      animations,
+    const requestedMoveId = danceState?.activeMove?.id ?? "neutral-ready";
+    const isOriginalPuppetMove =
+      danceState?.sequenceMode === "originalPuppet" &&
+      requestedMoveId.startsWith("original-latin-");
+
+    if (isOriginalPuppetMove) {
+      mixer.current.stopAllAction();
+      activeAction.current = null;
+      activeBinding.current = null;
+      activeSupportAction.current = null;
+      activeSupportBinding.current = null;
+      transitionAction.current = null;
+      transitionBinding.current = null;
+      restoreSkeletonPose(fitted.clonedScene);
+      return;
+    }
+
+    const resolvedMove = resolveDanceAnimationClip({
+      moveId: requestedMoveId,
+      animations: availableAnimations,
       animationSetId: slot.animationSet,
     });
+    const neutralMove = resolveDanceAnimationClip({
+      moveId: "neutral-ready",
+      animations: availableAnimations,
+      animationSetId: slot.animationSet,
+    });
+    const resolvedNeutral =
+      resolvedMove.clip || requestedMoveId === "neutral-ready"
+        ? resolvedMove
+        : neutralMove;
+    const resolved = resolvedMove.clip ? resolvedMove : resolvedNeutral;
 
     if (!resolved.clip) {
       mixer.current.stopAllAction();
       restoreSkeletonPose(fitted.clonedScene);
       activeAction.current = null;
       activeBinding.current = null;
+      activeSupportAction.current = null;
+      activeSupportBinding.current = null;
+      transitionAction.current = null;
+      transitionBinding.current = null;
       return;
     }
 
     const nextAction = mixer.current.clipAction(resolved.clip);
+    const supportAction =
+      danceMoveMap[requestedMoveId]?.tags?.includes("poseHold") &&
+      neutralMove.clip &&
+      neutralMove.clip !== resolved.clip
+        ? mixer.current.clipAction(neutralMove.clip)
+        : null;
+    const previousAction = activeAction.current;
+    const previousBinding = activeBinding.current;
+    const isSameAction = previousAction === nextAction;
 
-    if (activeAction.current && activeAction.current !== nextAction) {
-      activeAction.current.fadeOut(0.12);
+    if (
+      transitionAction.current &&
+      transitionAction.current !== previousAction &&
+      transitionAction.current !== nextAction
+    ) {
+      transitionAction.current.stop();
+    }
+
+    if (activeSupportAction.current && activeSupportAction.current !== supportAction) {
+      activeSupportAction.current.stop();
+    }
+
+    if (!isSameAction) {
+      nextAction.reset();
+    }
+
+    if (previousAction && previousBinding && !isSameAction) {
+      transitionAction.current = previousAction;
+      transitionBinding.current = previousBinding;
+      transitionAction.current
+        .setLoop(THREE.LoopRepeat, Infinity)
+        .setEffectiveWeight(1)
+        .play();
+    } else if (transitionAction.current && transitionAction.current !== nextAction) {
+      transitionAction.current.stop();
+      transitionAction.current = null;
+      transitionBinding.current = null;
     }
 
     nextAction
-      .reset()
       .setLoop(THREE.LoopRepeat, Infinity)
       .setEffectiveWeight(1)
-      .fadeIn(0.12)
       .play();
+
+    if (supportAction) {
+      supportAction
+        .reset()
+        .setLoop(THREE.LoopRepeat, Infinity)
+        .setEffectiveWeight(0)
+        .play();
+    }
+
+    const clipPhase = danceState?.activeMove ? danceState?.modulePhase ?? 0 : 0;
+    const poseBlend = getPoseModuleBlend(requestedMoveId, clipPhase);
+
+    if (supportAction && poseBlend !== null) {
+      nextAction.time = getSyncedClipTime(nextAction.getClip(), clipPhase, resolved.binding);
+      supportAction.time = getSyncedClipTime(
+        supportAction.getClip(),
+        clipPhase,
+        neutralMove.binding,
+      );
+      nextAction.setEffectiveWeight(poseBlend);
+      supportAction.setEffectiveWeight(1 - poseBlend);
+      mixer.current.update(0);
+    } else {
+      nextAction.time = getSyncedClipTime(nextAction.getClip(), clipPhase, resolved.binding);
+      mixer.current.update(0);
+    }
 
     activeAction.current = nextAction;
     activeBinding.current = resolved.binding;
-  }, [animations, danceState?.activeMove?.id, fitted.clonedScene, slot.animationSet]);
+    activeSupportAction.current = supportAction;
+    activeSupportBinding.current = supportAction ? neutralMove.binding : null;
+  }, [
+    availableAnimations,
+    danceState?.activeMove?.id,
+    danceState?.activeSlotIndex,
+    danceState?.sequenceMode,
+    fitted.clonedScene,
+    slot.animationSet,
+  ]);
 
   useFrame(({ clock }) => {
     const formationPose = getFormationPose({
@@ -162,29 +517,10 @@ function FittedCharacter({ scene, animations = [], slot, syncState, danceState }
       slot,
       modulePhase: danceState?.modulePhase ?? 0,
       activeSlotIndex: danceState?.activeSlotIndex ?? 0,
+      sequence: danceState?.sequence ?? [],
     });
 
-    if (mixer.current && activeAction.current) {
-      if (root.current) {
-        root.current.position.set(...formationPose.position);
-        root.current.rotation.set(0, formationPose.rotationY, 0);
-      }
-
-      const clipTime = getSyncedClipTime(
-        activeAction.current.getClip(),
-        danceState?.modulePhase ?? 0,
-        activeBinding.current,
-      );
-
-      mixer.current.setTime(clipTime);
-      return;
-    }
-
-    if (!root.current) {
-      return;
-    }
-
-    const activeMoveId = danceState?.activeMove?.id ?? "bounce-step";
+    const activeMoveId = danceState?.activeMove?.id ?? "neutral-ready";
     const pose = getProceduralDancePose(
       activeMoveId,
       slot.id,
@@ -192,13 +528,127 @@ function FittedCharacter({ scene, animations = [], slot, syncState, danceState }
       syncState?.beatPulse ?? 0,
       syncState?.bassEnergy ?? 0,
     );
-    const idle = Math.sin(clock.getElapsedTime() * 1.6) * 0.04;
+    const originalRootMotionPose = getOriginalRootMotionPose({
+      movieData: originalMovieData,
+      slotId: slot.id,
+      activeMove: danceState?.activeMove,
+      modulePhase: danceState?.modulePhase ?? 0,
+      basePosition: slot.position,
+      baseRotationY: danceState?.sequenceMode === "originalPuppet" ? 0 : slot.rotationY,
+      slotBasePositions,
+    });
+
+    if (mixer.current && activeAction.current) {
+      if (root.current) {
+        const isOriginalMove = activeMoveId.startsWith("original-latin-");
+        const positionScale = 0.3;
+        const verticalScale = 0.12;
+        const rotationScale = 0.16;
+
+        if (originalRootMotionPose) {
+          root.current.position.set(...originalRootMotionPose.position);
+          root.current.rotation.x = originalRootMotionPose.rotationX;
+          root.current.rotation.y = originalRootMotionPose.rotationY;
+          root.current.rotation.z = originalRootMotionPose.rotationZ;
+        } else {
+          root.current.position.x = formationPose.position[0] + pose.x * positionScale;
+          root.current.position.y = formationPose.position[1] + pose.y * verticalScale;
+          root.current.position.z = formationPose.position[2] + pose.z * positionScale;
+          root.current.rotation.x = 0;
+          root.current.rotation.y = formationPose.rotationY + pose.rotationY * rotationScale;
+          root.current.rotation.z = pose.rotationZ * (isOriginalMove ? 0.18 : 0.08);
+        }
+      }
+
+      const clipPhase = danceState?.activeMove ? danceState?.modulePhase ?? 0 : 0;
+      const clipTime = getSyncedClipTime(
+        activeAction.current.getClip(),
+        clipPhase,
+        activeBinding.current,
+      );
+      const transitionState = getActionTransitionState(
+        clipPhase,
+        danceState?.activeBeatSpan ?? danceState?.activeMove?.beatSpan ?? 8,
+      );
+      const hasTransition =
+        transitionAction.current &&
+        transitionBinding.current &&
+        transitionAction.current !== activeAction.current &&
+        transitionState.blend < 1;
+      const activeWeight = hasTransition ? transitionState.blend : 1;
+      const transitionWeight = hasTransition ? 1 - transitionState.blend : 0;
+      const poseBlend = getPoseModuleBlend(activeMoveId, clipPhase) ?? 1;
+
+      activeAction.current.time = clipTime;
+      activeAction.current.setEffectiveWeight(activeWeight * poseBlend);
+
+      if (activeSupportAction.current) {
+        const supportClipTime = getSyncedClipTime(
+          activeSupportAction.current.getClip(),
+          clipPhase,
+          activeSupportBinding.current,
+        );
+
+        activeSupportAction.current.time = supportClipTime;
+        activeSupportAction.current.setEffectiveWeight(activeWeight * (1 - poseBlend));
+      }
+
+      if (hasTransition) {
+        transitionAction.current.time = getSyncedClipTime(
+          transitionAction.current.getClip(),
+          transitionState.previousPhase,
+          transitionBinding.current,
+        );
+        transitionAction.current.setEffectiveWeight(transitionWeight);
+      } else {
+        if (transitionAction.current && transitionAction.current !== activeAction.current) {
+          transitionAction.current.stop();
+        }
+        transitionAction.current = null;
+        transitionBinding.current = null;
+      }
+
+      mixer.current.update(0);
+
+      if (originalRootMotionPose) {
+        applyOriginalPuppetPose(originalPuppetRig, originalRootMotionPose, root.current);
+      }
+
+      if (!originalRootMotionPose?.isLiftedPose) {
+        groundCharacterToStage(root.current, footContactRig, visibleContactRig, activeMoveId);
+      }
+
+      return;
+    }
+
+    if (!root.current) {
+      return;
+    }
+
+    const idle =
+      activeMoveId === "neutral-ready" || activeMoveId === "female-standing-pose"
+        ? 0
+        : Math.sin(clock.getElapsedTime() * 1.6) * 0.04;
+
+    if (originalRootMotionPose) {
+      root.current.position.set(...originalRootMotionPose.position);
+      root.current.rotation.x = originalRootMotionPose.rotationX;
+      root.current.rotation.y = originalRootMotionPose.rotationY;
+      root.current.rotation.z = originalRootMotionPose.rotationZ;
+      applyOriginalPuppetPose(originalPuppetRig, originalRootMotionPose, root.current);
+      if (!originalRootMotionPose.isLiftedPose) {
+        groundCharacterToStage(root.current, footContactRig, visibleContactRig, activeMoveId);
+      }
+      return;
+    }
 
     root.current.position.x = formationPose.position[0] + pose.x * 0.45;
     root.current.position.y = formationPose.position[1] + idle + pose.y * 0.25;
     root.current.position.z = formationPose.position[2] + pose.z * 0.45;
+    root.current.rotation.x = 0;
     root.current.rotation.y = formationPose.rotationY + pose.rotationY * 0.35;
     root.current.rotation.z = pose.rotationZ * 0.2;
+    groundCharacterToStage(root.current, footContactRig, visibleContactRig, activeMoveId);
   });
 
   return (
@@ -212,7 +662,13 @@ function FittedCharacter({ scene, animations = [], slot, syncState, danceState }
   );
 }
 
-function ImportedGltfCharacter({ slot, syncState, danceState }) {
+function ImportedGltfCharacter({
+  slot,
+  syncState,
+  danceState,
+  externalAnimations,
+  originalMovieData,
+}) {
   const gltf = useGLTF(slot.url);
 
   return (
@@ -222,11 +678,19 @@ function ImportedGltfCharacter({ slot, syncState, danceState }) {
       slot={slot}
       syncState={syncState}
       danceState={danceState}
+      externalAnimations={externalAnimations}
+      originalMovieData={originalMovieData}
     />
   );
 }
 
-function ImportedFbxCharacter({ slot, syncState, danceState }) {
+function ImportedFbxCharacter({
+  slot,
+  syncState,
+  danceState,
+  externalAnimations,
+  originalMovieData,
+}) {
   const fbx = useFBX(slot.url);
 
   return (
@@ -236,11 +700,19 @@ function ImportedFbxCharacter({ slot, syncState, danceState }) {
       slot={slot}
       syncState={syncState}
       danceState={danceState}
+      externalAnimations={externalAnimations}
+      originalMovieData={originalMovieData}
     />
   );
 }
 
-function ImportedCharacter({ slot, syncState, danceState }) {
+function ImportedCharacter({
+  slot,
+  syncState,
+  danceState,
+  externalAnimations,
+  originalMovieData,
+}) {
   const url = slot.url.toLowerCase();
 
   if (url.endsWith(".fbx")) {
@@ -249,6 +721,8 @@ function ImportedCharacter({ slot, syncState, danceState }) {
         slot={slot}
         syncState={syncState}
         danceState={danceState}
+        externalAnimations={externalAnimations}
+        originalMovieData={originalMovieData}
       />
     );
   }
@@ -258,6 +732,8 @@ function ImportedCharacter({ slot, syncState, danceState }) {
       slot={slot}
       syncState={syncState}
       danceState={danceState}
+      externalAnimations={externalAnimations}
+      originalMovieData={originalMovieData}
     />
   );
 }
@@ -278,6 +754,7 @@ function PlaceholderCharacter({ slot, syncState, danceState }) {
       slot,
       modulePhase: danceState?.modulePhase ?? 0,
       activeSlotIndex: danceState?.activeSlotIndex ?? 0,
+      sequence: danceState?.sequence ?? [],
     });
     const pose = getProceduralDancePose(
       activeMoveId,
@@ -361,7 +838,28 @@ function PlaceholderCharacter({ slot, syncState, danceState }) {
   );
 }
 
-export default function CharacterSlots({ syncState, danceState }) {
+function CharacterSlotGroup({ syncState, danceState }) {
+  const externalAnimations = useExternalDanceAnimationClips(danceState);
+  const [originalMovieData, setOriginalMovieData] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    loadOriginalMovieData()
+      .then((loadedMovieData) => {
+        if (!cancelled) {
+          setOriginalMovieData(loadedMovieData);
+        }
+      })
+      .catch((error) => {
+        console.error("Original movie data failed to load", error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <group>
       {characterSlots.map((slot) =>
@@ -371,6 +869,8 @@ export default function CharacterSlots({ syncState, danceState }) {
             slot={slot}
             syncState={syncState}
             danceState={danceState}
+            externalAnimations={externalAnimations}
+            originalMovieData={originalMovieData}
           />
         ) : (
           <PlaceholderCharacter
@@ -383,4 +883,12 @@ export default function CharacterSlots({ syncState, danceState }) {
       )}
     </group>
   );
+}
+
+export default function CharacterSlots({ syncState, danceState }) {
+  if (danceState?.sequenceMode === "original") {
+    return <OriginalBlockDancers danceState={danceState} />;
+  }
+
+  return <CharacterSlotGroup syncState={syncState} danceState={danceState} />;
 }

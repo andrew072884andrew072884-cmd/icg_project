@@ -29,21 +29,21 @@ when the lighting changes.
 ### Rendering equation
 
 The core idea of physically based shading is the rendering equation. For a point
-`p` on a surface, the outgoing light toward the viewer direction `ω_o` is:
+`p` on a surface, the outgoing light toward the viewer direction `?_o` is:
 
 ```text
-L_o(p, ω_o) = ∫Ω f_r(p, ω_i, ω_o) L_i(p, ω_i) max(n · ω_i, 0) dω_i
+L_o(p, ?_o) = ?��?f_r(p, ?_i, ?_o) L_i(p, ?_i) max(n · ?_i, 0) d?_i
 ```
 
 Where:
 
 - `L_o` is the outgoing radiance toward the camera.
 - `L_i` is incoming radiance from a light direction.
-- `ω_i` is the incoming light direction.
-- `ω_o` is the outgoing view direction.
+- `?_i` is the incoming light direction.
+- `?_o` is the outgoing view direction.
 - `n` is the surface normal.
 - `f_r` is the BRDF, which describes how the material reflects light.
-- `max(n · ω_i, 0)` darkens light that hits the surface at a shallow angle.
+- `max(n · ?_i, 0)` darkens light that hits the surface at a shallow angle.
 
 The BRDF can be understood as:
 
@@ -67,7 +67,7 @@ f_r = f_diffuse + f_specular
 The diffuse part is often Lambertian:
 
 ```text
-f_diffuse = (1 - F) * c_diff / π
+f_diffuse = (1 - F) * c_diff / ?
 ```
 
 The specular part is commonly modeled with a microfacet BRDF:
@@ -117,7 +117,7 @@ distribution is GGX:
 
 ```text
 D_GGX(n, h, α) =
-α² / [π ((n · h)²(α² - 1) + 1)²]
+α² / [? ((n · h)²(α² - 1) + 1)²]
 ```
 
 When `α` is small, the microfacets point in similar directions, creating a
@@ -274,14 +274,28 @@ url: "/assets/characters/lead.fbx"
 - a bottom `Dance Sequence Builder` panel appears with a recommended move order
 - the dance sequence panel can now collapse downward from the bottom of the screen
 - `Recommend` builds a new sequence by matching music sections to move categories
-- `Original` restores the source project order by looping the 16 original choreography modules
+- `Original` loads the source project order with the restored block dancers
+- `Original Puppet` loads the same source project order and drives the imported humanoid characters from the 16 original choreography modules
 - users can manually replace each module before confirming the sequence
 - playback is locked until the dance sequence is confirmed
 - while music is playing, the dance sequence is read-only; pause playback before editing
 - placeholder dancers now preview the selected module sequence with beat-synced procedural motion
 - imported characters can use embedded `.fbx` / `.glb` animation clips through `THREE.AnimationMixer`
+- Mixamo animation-only FBX files in `public/assets/animations/` can now drive both imported characters through the shared external animation registry
 - character position, spacing, and facing direction are controlled separately from body animation, so simple Mixamo clips can still support pair formations
 - detailed animation pipeline: `docs/ANIMATION_PIPELINE.md`
+
+### Current dance move choices
+
+- Original legacy: 16 `Original Latin` modules from the old `MMOVIE.TXT` / `FMOVIE.TXT` choreography render through the restored block dancers.
+- Original puppet: the same 16 modules drive the imported humanoid characters through a coarse block-rig puppet mapping.
+- Mixamo real clips: `Breakdance Ready` and `Breakdance Ending 1`, loaded from `public/assets/animations/`.
+- The external Mixamo clips are automatically retargeted from `mixamorig:*` / `mixamorig...` track names to the active character rig, including `mixamorig1:*` naming.
+- `Original Latin` modules no longer use breakdance approximations; the old block-rig segment directions are mapped onto the current humanoid bones.
+- Long source clips can reserve more timeline space: `Breakdance Ending 1` uses a 16-beat module, while shorter ready/neutral clips use 8 beats.
+- `Bounce Step` is a legacy placeholder; when humanoid FBX characters are loaded it maps to the neutral ready clip so the characters do not fall back to an unmoving T/A-pose.
+- Procedural placeholders: `Side Groove`, `Bounce Step`, `Arm Wave`, `Cross Step`, `Turn Accent`, `Power Hit`, `Jump Kick`, and `Freeze Pose`.
+- Embedded character clips: if an imported FBX contains only one animation and no exact move match is found, the character can still fall back to that embedded clip.
 
 ### Public dance motion sources
 
@@ -369,9 +383,21 @@ concert beams at much lower performance cost.
 - Stronger Korean-stage impact usually comes from increasing `chorus.opacity`, `chorus.spread`, and `chorus.intensity`.
 - More subtle haze usually comes from lowering the `beatPulse` and `bassEnergy` multipliers in `BeatHaze.jsx`.
 
+## Original legacy dance mode
+
+- Pressing `Original` or `Original Puppet` in the Dance Sequence Builder loads the original project audio from `public/assets/original/dance.mp3`.
+- The same audio analysis pipeline detects BPM, beat grid, section candidates, bass energy, and lighting cues for the legacy track.
+- Original motion data is loaded from `public/assets/original/MMOVIE.TXT` and `public/assets/original/FMOVIE.TXT`.
+- `src/dance/originalMovie.js` parses the old 32-channel keyframe rows and samples the correct frame inside each 8-beat phrase.
+- `Original` renders `src/scene/OriginalBlockDancers.jsx`, the restored Three.js block-rig version of the old male/female dancers.
+- `Original Puppet` keeps the imported humanoid characters visible; `src/dance/originalMovie.js` maps old block-rig segment directions onto the major humanoid bones while preserving the characters' mesh, texture, and material.
+- The `Original Latin 01-16` modules repeat until the analyzed audio duration ends, so the legacy choreography stays aligned to the beat grid instead of the old fixed `117 ms` timer.
+- The mode is auto-confirmed after loading, so Play is available once the browser has loaded and analyzed the audio.
+
 ## Next implementation phase
 
 - import real Character Creator avatars
 - load dance animation clips
 - attach real dancer animation timing to the music clock
 - restore color-change and zoom-change effects from the original project
+

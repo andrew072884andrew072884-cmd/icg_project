@@ -244,9 +244,9 @@ function locateSegmentIndex(times, currentTime) {
   return clamp(high, 0, times.length - 1);
 }
 
-function analyzeSections(beatTimes, envelopeTimes, envelope, novelty, duration) {
+function analyzeSections(beatTimes, envelopeTimes, envelope, novelty, duration, activeBounds = null) {
   if (beatTimes.length < 8) {
-    return [];
+    return createStructuralFallbackSections(beatTimes, duration, activeBounds);
   }
 
   const sections = [];
@@ -287,7 +287,7 @@ function analyzeSections(beatTimes, envelopeTimes, envelope, novelty, duration) 
   const normalizedEnergy = normalizeArray(barMetrics.map((bar) => bar.energy));
   const normalizedActivity = normalizeArray(barMetrics.map((bar) => bar.activity));
   const scores = barMetrics.map((_, index) => normalizedEnergy[index] * 0.7 + normalizedActivity[index] * 0.3);
-  const threshold = percentile(scores, 0.68);
+  const threshold = percentile(scores, 0.64);
 
   let sectionStart = null;
 
@@ -327,7 +327,307 @@ function analyzeSections(beatTimes, envelopeTimes, envelope, novelty, duration) 
     });
   }
 
+  const refinedSections = refineSections(sections, beatTimes, duration, activeBounds);
+
+  return refinedSections.length
+    ? refinedSections
+    : createStructuralFallbackSections(beatTimes, duration, activeBounds);
+}
+
+function findNearestBeatTime(beatTimes, targetTime, fallbackTime) {
+  if (!beatTimes.length) {
+    return fallbackTime;
+  }
+
+  let bestTime = beatTimes[0];
+  let bestDistance = Math.abs(bestTime - targetTime);
+
+  beatTimes.forEach((beatTime) => {
+    const distance = Math.abs(beatTime - targetTime);
+
+    if (distance < bestDistance) {
+      bestTime = beatTime;
+      bestDistance = distance;
+    }
+  });
+
+  return bestTime;
+}
+
+function createStructuralFallbackSections(beatTimes, duration, activeBounds = null) {
+  const activeStartTime = activeBounds?.startTime ?? 0;
+  const activeEndTime = activeBounds?.endTime ?? duration;
+  const activeDuration = Math.max(0, activeEndTime - activeStartTime);
+
+  if (activeDuration <= 0) {
+    return [];
+  }
+
+  const averageBeatDuration =
+    beatTimes.length > 1
+      ? (beatTimes[beatTimes.length - 1] - beatTimes[0]) / (beatTimes.length - 1)
+      : activeDuration / 128;
+  const safeBeatDuration = Math.max(0.25, Math.min(1.2, averageBeatDuration || 0.5));
+  const minSectionDuration = Math.min(
+    activeDuration,
+    Math.max(10, safeBeatDuration * 24, activeDuration * 0.08),
+  );
+  const preferredSectionDuration = Math.min(
+    activeDuration * 0.26,
+    Math.max(safeBeatDuration * 40, activeDuration * 0.16),
+  );
+  const sectionDuration = Math.max(minSectionDuration, preferredSectionDuration);
+
+  if (activeDuration < minSectionDuration * 2.2) {
+    return [
+      {
+        label: "Main section fallback 1",
+        startTime: activeStartTime,
+        endTime: activeEndTime,
+        confidence: 0.45,
+        fallback: true,
+      },
+    ];
+  }
+
+  const windows = [
+    [0.34, 0.34 + sectionDuration / activeDuration],
+    [0.68, 0.68 + sectionDuration / activeDuration],
+  ];
+  const sections = [];
+
+  windows.forEach(([relativeStart, relativeEnd]) => {
+    const rawStart = activeStartTime + activeDuration * relativeStart;
+    const rawEnd = activeStartTime + activeDuration * Math.min(0.96, relativeEnd);
+    const snappedStart = findNearestBeatTime(beatTimes, rawStart, rawStart);
+    const snappedEnd = findNearestBeatTime(beatTimes, rawEnd, rawEnd);
+    const startTime = clamp(snappedStart, activeStartTime, activeEndTime);
+    const endTime = clamp(
+      Math.max(snappedEnd, startTime + minSectionDuration),
+      startTime,
+      activeEndTime,
+    );
+
+    if (
+      endTime - startTime >= minSectionDuration &&
+      !sections.some(
+        (section) => startTime < section.endTime && endTime > section.startTime,
+      )
+    ) {
+      sections.push({
+        label: `Main section fallback ${sections.length + 1}`,
+        startTime,
+        endTime,
+        confidence: 0.42,
+        fallback: true,
+      });
+    }
+  });
+
   return sections;
+}
+
+function expandSectionToPhrase(section, targetDuration, beatTimes, activeStartTime, activeEndTime) {
+  const activeDuration = Math.max(0.001, activeEndTime - activeStartTime);
+  const targetSpan = Math.min(targetDuration, activeDuration);
+  const currentDuration = section.endTime - section.startTime;
+
+  if (currentDuration >= targetSpan || targetSpan <= 0) {
+    return { ...section };
+  }
+
+  const centerTime = clamp(
+    (section.startTime + section.endTime) * 0.5,
+    activeStartTime,
+    activeEndTime,
+  );
+  const desiredStart = centerTime - targetSpan * 0.5;
+  const desiredEnd = centerTime + targetSpan * 0.5;
+  let startTime = findNearestBeatTime(beatTimes, desiredStart, desiredStart);
+  let endTime = findNearestBeatTime(beatTimes, desiredEnd, desiredEnd);
+
+  if (endTime - startTime < targetSpan * 0.9) {
+    startTime = desiredStart;
+    endTime = desiredEnd;
+  }
+
+  if (startTime < activeStartTime) {
+    endTime += activeStartTime - startTime;
+    startTime = activeStartTime;
+  }
+
+  if (endTime > activeEndTime) {
+    startTime -= endTime - activeEndTime;
+    endTime = activeEndTime;
+  }
+
+  startTime = clamp(startTime, activeStartTime, activeEndTime);
+  endTime = clamp(Math.max(endTime, startTime + targetSpan * 0.9), startTime, activeEndTime);
+
+  return {
+    ...section,
+    startTime,
+    endTime,
+  };
+}
+
+function mergeOverlappingSections(sections, mergeGap = 0) {
+  return sections
+    .sort((a, b) => a.startTime - b.startTime)
+    .reduce((mergedSections, section) => {
+      const previous = mergedSections[mergedSections.length - 1];
+
+      if (previous && section.startTime - previous.endTime <= mergeGap) {
+        const previousDuration = previous.endTime - previous.startTime;
+        const sectionDuration = section.endTime - section.startTime;
+        const totalDuration = Math.max(0.001, previousDuration + sectionDuration);
+
+        previous.endTime = Math.max(previous.endTime, section.endTime);
+        previous.confidence =
+          (previous.confidence * previousDuration + section.confidence * sectionDuration) /
+          totalDuration;
+        previous.fallback = previous.fallback && section.fallback;
+        return mergedSections;
+      }
+
+      mergedSections.push({ ...section });
+      return mergedSections;
+    }, []);
+}
+
+function refineSections(sections, beatTimes, duration, activeBounds = null) {
+  if (!sections.length) {
+    return [];
+  }
+
+  const averageBeatDuration =
+    beatTimes.length > 1
+      ? (beatTimes[beatTimes.length - 1] - beatTimes[0]) / (beatTimes.length - 1)
+      : 0.5;
+  const safeBeatDuration = Math.max(0.25, Math.min(1.2, averageBeatDuration || 0.5));
+  const activeStartTime = activeBounds?.startTime ?? 0;
+  const activeEndTime = activeBounds?.endTime ?? duration;
+  const activeDuration = Math.max(0.001, activeEndTime - activeStartTime);
+  const minSectionDuration = Math.min(
+    activeDuration,
+    Math.max(10, safeBeatDuration * 24, activeDuration * 0.08),
+  );
+  const targetSectionDuration = Math.max(
+    minSectionDuration,
+    Math.min(activeDuration * 0.24, Math.max(safeBeatDuration * 32, activeDuration * 0.12)),
+  );
+  const mergeGap = safeBeatDuration * 16;
+  const mergedSections = [];
+
+  sections
+    .forEach((section) => {
+      const previous = mergedSections[mergedSections.length - 1];
+
+      if (previous && section.startTime - previous.endTime <= mergeGap) {
+        const previousDuration = previous.endTime - previous.startTime;
+        const sectionDuration = section.endTime - section.startTime;
+
+        previous.endTime = section.endTime;
+        previous.confidence =
+          (previous.confidence * previousDuration + section.confidence * sectionDuration) /
+          Math.max(0.001, previousDuration + sectionDuration);
+        return;
+      }
+
+      mergedSections.push({ ...section });
+    });
+
+  return mergeOverlappingSections(
+    mergedSections.map((section) =>
+      expandSectionToPhrase(
+        section,
+        targetSectionDuration,
+        beatTimes,
+        activeStartTime,
+        activeEndTime,
+      ),
+    ),
+    safeBeatDuration * 4,
+  )
+    .filter((section) => {
+      const sectionDuration = section.endTime - section.startTime;
+
+      return (
+        sectionDuration >= minSectionDuration &&
+        section.startTime >= activeStartTime + activeDuration * 0.08 &&
+        section.endTime <= activeStartTime + activeDuration * 0.98
+      );
+    })
+    .sort((a, b) => b.confidence - a.confidence)
+    .slice(0, 3)
+    .sort((a, b) => a.startTime - b.startTime)
+    .map((section, index) => ({
+      ...section,
+      label: `Main section candidate ${index + 1}`,
+    }));
+}
+
+function detectActiveMusicBounds(envelopeTimes, envelope, duration, hopDuration) {
+  if (!envelope.length || duration <= 0) {
+    return {
+      startTime: 0,
+      endTime: duration,
+      duration,
+    };
+  }
+
+  const noiseFloor = percentile(envelope, 0.1);
+  const bodyLevel = percentile(envelope, 0.88);
+  const peakLevel = percentile(envelope, 0.98);
+  const dynamicRange = Math.max(0, bodyLevel - noiseFloor);
+  const threshold = Math.max(
+    noiseFloor + dynamicRange * 0.12,
+    peakLevel * 0.025,
+    0.0005,
+  );
+  const activeFlags = envelope.map((value) => (value >= threshold ? 1 : 0));
+  const windowRadius = Math.max(1, Math.round(0.42 / Math.max(hopDuration, 0.001)));
+  const activityRatio = movingAverage(activeFlags, windowRadius);
+  const minRatio = 0.26;
+  let firstActiveIndex = activityRatio.findIndex((value) => value >= minRatio);
+  let lastActiveIndex = -1;
+
+  for (let index = activityRatio.length - 1; index >= 0; index -= 1) {
+    if (activityRatio[index] >= minRatio) {
+      lastActiveIndex = index;
+      break;
+    }
+  }
+
+  if (firstActiveIndex < 0 || lastActiveIndex < firstActiveIndex) {
+    return {
+      startTime: 0,
+      endTime: duration,
+      duration,
+    };
+  }
+
+  const startTime = clamp(envelopeTimes[firstActiveIndex] - 0.12, 0, duration);
+  const endTime = clamp(
+    envelopeTimes[lastActiveIndex] + hopDuration * (windowRadius + 2),
+    startTime,
+    duration,
+  );
+  const activeDuration = endTime - startTime;
+
+  if (activeDuration < Math.min(8, duration * 0.35)) {
+    return {
+      startTime: 0,
+      endTime: duration,
+      duration,
+    };
+  }
+
+  return {
+    startTime,
+    endTime,
+    duration: activeDuration,
+  };
 }
 
 export async function analyzeAudioBuffer(audioBuffer) {
@@ -336,11 +636,12 @@ export async function analyzeAudioBuffer(audioBuffer) {
   const sampleRate = audioBuffer.sampleRate;
   const { envelope, times, hopDuration } = createEnvelope(channelData, sampleRate);
   const novelty = createNovelty(envelope);
+  const activeBounds = detectActiveMusicBounds(times, envelope, duration, hopDuration);
   const { beatInterval, confidence } = estimateBeatInterval(novelty, hopDuration);
   const peaks = detectPeaks(novelty, times, beatInterval);
   const beatTimes = buildBeatGrid(peaks, beatInterval, duration);
   const detectedBpm = clamp(Math.round(60 / Math.max(beatInterval, 0.001)), 40, 220);
-  const sections = analyzeSections(beatTimes, times, envelope, novelty, duration);
+  const sections = analyzeSections(beatTimes, times, envelope, novelty, duration, activeBounds);
 
   return {
     detectedBpm,
@@ -348,6 +649,7 @@ export async function analyzeAudioBuffer(audioBuffer) {
     beatTimes,
     sections,
     confidence,
+    activeBounds,
   };
 }
 

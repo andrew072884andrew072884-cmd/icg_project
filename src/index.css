@@ -360,6 +360,15 @@ button {
   padding-bottom: 4px;
 }
 
+.dance-sequence-empty {
+  border: 1px dashed rgba(255, 255, 255, 0.16);
+  border-radius: 14px;
+  padding: 12px 14px;
+  color: rgba(243, 246, 251, 0.7);
+  background: rgba(255, 255, 255, 0.045);
+  font-size: 0.84rem;
+}
+
 .dance-slot {
   display: grid;
   gap: 6px;

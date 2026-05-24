@@ -3,6 +3,10 @@ import {
   analyzeAudioBuffer,
   computeBeatMetricsFromGrid,
 } from "../audio/analysis";
+import {
+  ORIGINAL_AUDIO_NAME,
+  ORIGINAL_AUDIO_URL,
+} from "../dance/originalMovie";
 
 const METRICS_UPDATE_INTERVAL_MS = 1000 / 30;
 
@@ -14,11 +18,21 @@ const defaultMetrics = {
   beatPhase: 0,
   beatPulse: 0,
   beatDuration: 0.5,
+  sequenceBeatDuration: 0.5,
+  sequenceBeatPosition: 0,
+  sequenceTotalBeats: 0,
+  musicStartTime: 0,
+  musicEndTime: 0,
+  activeMusicDuration: 0,
   bassEnergy: 0,
   currentSection: null,
   isMainSection: false,
   stageCue: "intro",
 };
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 function createAudioElement() {
   const element = new Audio();
@@ -48,6 +62,7 @@ export default function useAudioEngine() {
   const objectUrlRef = useRef("");
   const beatTimesRef = useRef([]);
   const sectionsRef = useRef([]);
+  const activeBoundsRef = useRef(null);
 
   if (!audioRef.current) {
     audioRef.current = createAudioElement();
@@ -65,12 +80,16 @@ export default function useAudioEngine() {
   }, []);
 
   const resolveStageCue = useCallback(
-    (currentTime, beatDuration, currentSection) => {
+    (currentTime, beatDuration, currentSection, musicStartTime = 0, musicEndTime = Infinity) => {
+      if (currentTime < musicStartTime || currentTime > musicEndTime) {
+        return "intro";
+      }
+
       if (currentSection) {
         return "chorus";
       }
 
-      if (currentTime < 12) {
+      if (currentTime - musicStartTime < 12) {
         return "intro";
       }
 
@@ -90,6 +109,26 @@ export default function useAudioEngine() {
     const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
     const offsetSeconds = beatOffsetMs / 1000;
     const currentSection = findCurrentSection(currentTime);
+    const sequenceBeatDuration = 60 / effectiveBpm;
+    const musicStartTime = Number.isFinite(activeBoundsRef.current?.startTime)
+      ? activeBoundsRef.current.startTime
+      : 0;
+    const musicEndTime = Number.isFinite(activeBoundsRef.current?.endTime)
+      ? Math.min(duration || activeBoundsRef.current.endTime, activeBoundsRef.current.endTime)
+      : duration;
+    const activeMusicDuration = Math.max(0, musicEndTime - musicStartTime);
+    const sequenceTotalBeats = activeMusicDuration > 0
+      ? Math.max(1, Math.floor(activeMusicDuration / sequenceBeatDuration))
+      : 0;
+    const adjustedSequenceTime = Math.max(0, currentTime - musicStartTime - offsetSeconds);
+    const sequenceBeatPosition =
+      activeMusicDuration > 0 && currentTime >= musicEndTime - 0.05
+        ? sequenceTotalBeats
+        : clamp(
+            adjustedSequenceTime / sequenceBeatDuration,
+            0,
+            sequenceTotalBeats,
+          );
 
     let beatMetrics;
 
@@ -141,12 +180,20 @@ export default function useAudioEngine() {
       currentTime,
       duration,
       bassEnergy,
+      sequenceBeatDuration,
+      sequenceBeatPosition,
+      sequenceTotalBeats,
+      musicStartTime,
+      musicEndTime,
+      activeMusicDuration,
       currentSection,
       isMainSection: Boolean(currentSection),
       stageCue: resolveStageCue(
         currentTime,
         beatMetrics.beatDuration ?? 60 / effectiveBpm,
         currentSection,
+        musicStartTime,
+        musicEndTime,
       ),
     });
   }, [audio, beatOffsetMs, effectiveBpm, findCurrentSection, resolveStageCue, timingMode]);
@@ -182,6 +229,54 @@ export default function useAudioEngine() {
     }
   }, [audio]);
 
+  const resetForNewTrack = useCallback(
+    (trackName) => {
+      stopTick();
+      audio.pause();
+      setIsPlaying(false);
+
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = "";
+      }
+
+      setSelectedTrackName(trackName);
+      setIsReady(false);
+      setAudioMetrics(defaultMetrics);
+      setAnalysisState("analyzing");
+      setAnalysisError("");
+      setDetectedBpm(null);
+      beatTimesRef.current = [];
+      sectionsRef.current = [];
+      activeBoundsRef.current = null;
+      setSectionCandidates([]);
+    },
+    [audio, stopTick],
+  );
+
+  const analyzeTrackBuffer = useCallback(async (fileBuffer) => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const decodeContext = new AudioContextClass();
+
+    try {
+      const decodedBuffer = await decodeContext.decodeAudioData(fileBuffer.slice(0));
+      const analysis = await analyzeAudioBuffer(decodedBuffer);
+
+      setDetectedBpm(analysis.detectedBpm);
+      beatTimesRef.current = analysis.beatTimes;
+      sectionsRef.current = analysis.sections;
+      activeBoundsRef.current = analysis.activeBounds ?? {
+        startTime: 0,
+        endTime: decodedBuffer.duration,
+        duration: decodedBuffer.duration,
+      };
+      setSectionCandidates(analysis.sections);
+      setAnalysisState("ready");
+    } finally {
+      await decodeContext.close();
+    }
+  }, []);
+
   const handleFileSelect = useCallback(
     async (event) => {
       const file = event.target.files?.[0];
@@ -190,52 +285,43 @@ export default function useAudioEngine() {
         return;
       }
 
-      stopTick();
-      audio.pause();
-      setIsPlaying(false);
-
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-      }
-
+      resetForNewTrack(file.name);
       objectUrlRef.current = URL.createObjectURL(file);
       audio.src = objectUrlRef.current;
       audio.load();
 
-      setSelectedTrackName(file.name);
-      setIsReady(false);
-      setAudioMetrics(defaultMetrics);
-      setAnalysisState("analyzing");
-      setAnalysisError("");
-      setDetectedBpm(null);
-      beatTimesRef.current = [];
-      sectionsRef.current = [];
-      setSectionCandidates([]);
-
       try {
         const fileBuffer = await file.arrayBuffer();
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        const decodeContext = new AudioContextClass();
-        try {
-          const decodedBuffer = await decodeContext.decodeAudioData(fileBuffer.slice(0));
-          const analysis = await analyzeAudioBuffer(decodedBuffer);
-
-          setDetectedBpm(analysis.detectedBpm);
-          beatTimesRef.current = analysis.beatTimes;
-          sectionsRef.current = analysis.sections;
-          setSectionCandidates(analysis.sections);
-          setAnalysisState("ready");
-        } finally {
-          await decodeContext.close();
-        }
+        await analyzeTrackBuffer(fileBuffer);
       } catch (error) {
         console.error("Audio analysis failed", error);
         setAnalysisState("error");
         setAnalysisError("Automatic beat detection failed. You can still set BPM manually.");
       }
     },
-    [audio, stopTick],
+    [analyzeTrackBuffer, audio, resetForNewTrack],
   );
+
+  const loadOriginalTrack = useCallback(async () => {
+    resetForNewTrack(ORIGINAL_AUDIO_NAME);
+    audio.src = ORIGINAL_AUDIO_URL;
+    audio.load();
+
+    try {
+      const response = await fetch(ORIGINAL_AUDIO_URL);
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch ${ORIGINAL_AUDIO_URL}`);
+      }
+
+      const fileBuffer = await response.arrayBuffer();
+      await analyzeTrackBuffer(fileBuffer);
+    } catch (error) {
+      console.error("Original audio analysis failed", error);
+      setAnalysisState("error");
+      setAnalysisError("Original dance.mp3 loaded, but automatic beat detection failed.");
+    }
+  }, [analyzeTrackBuffer, audio, resetForNewTrack]);
 
   const handleBpmChange = useCallback((event) => {
     const nextValue = Number(event.target.value);
@@ -388,6 +474,7 @@ export default function useAudioEngine() {
     handleTimingModeChange,
     handleBeatOffsetChange,
     handleSeekChange,
+    loadOriginalTrack,
     togglePlayback,
     restartPlayback,
   };

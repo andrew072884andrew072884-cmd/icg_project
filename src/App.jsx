@@ -29,6 +29,7 @@ export default function App() {
     handleTimingModeChange,
     handleBeatOffsetChange,
     handleSeekChange,
+    loadOriginalTrack,
     togglePlayback,
     restartPlayback,
   } = useAudioEngine();
@@ -40,6 +41,14 @@ export default function App() {
     analysisState,
     sectionCandidates,
   });
+  const handleUseOriginal = async () => {
+    dancePlanner.useOriginalSequence();
+    await loadOriginalTrack();
+  };
+  const handleUseOriginalPuppet = async () => {
+    dancePlanner.useOriginalPuppetSequence();
+    await loadOriginalTrack();
+  };
 
   return (
     <div className="app-shell">
@@ -94,7 +103,8 @@ export default function App() {
         collapsed={dancePanelCollapsed}
         onMoveChange={dancePlanner.updateMoveAt}
         onRegenerate={dancePlanner.regenerateSequence}
-        onUseOriginal={dancePlanner.useOriginalSequence}
+        onUseOriginal={handleUseOriginal}
+        onUseOriginalPuppet={handleUseOriginalPuppet}
         onToggleCollapsed={() => setDancePanelCollapsed((collapsed) => !collapsed)}
         onConfirm={dancePlanner.confirmSequence}
       />

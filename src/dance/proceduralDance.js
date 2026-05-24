@@ -50,6 +50,25 @@ export function getProceduralDancePose(moveId, slotId, modulePhase, beatPulse, b
   const pulse = beatPulse + bassEnergy * 0.45;
 
   switch (moveId) {
+    case "neutral-ready":
+      return {
+        x: 0,
+        y: 0,
+        z: 0,
+        rotationY: 0,
+        rotationZ: 0,
+      };
+    case "female-standing-pose":
+    case "female-dance-pose":
+    case "female-dance-pose-1":
+    case "male-dance-pose":
+      return {
+        x: Math.sin(loop) * 0.025 * mirror,
+        y: pulse * 0.025,
+        z: Math.cos(loop) * 0.018,
+        rotationY: Math.sin(loop) * 0.025 * mirror,
+        rotationZ: Math.cos(loop) * 0.018 * mirror,
+      };
     case "side-groove":
       return {
         x: Math.sin(loop) * 0.26 * mirror,
